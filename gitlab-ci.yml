@@ -1,0 +1,142 @@
+include:
+  - template: Terraform/Base.latest.gitlab-ci.yml
+  - template: Jobs/SAST-IaC.latest.gitlab-ci.yml
+  - project: "devops/gitlab/ci-templates/general"
+    file:
+      - ".install_hashicorp_vault.yml"
+      - ".vault_jwt_auth.yml"
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables:
+        ENVIRONMENT_NAME: "production"
+
+stages:
+  - run_aws_cli
+  - validate
+  - test
+  - build
+  - deploy
+
+.prepare_env: &prepare_env
+  # Install necessary packages
+  - !reference [.install_hashicorp_vault, before_script]
+  - !reference [.vault_jwt_auth, before_script]
+
+  # Set env variables
+  - export TF_TOKEN_gitlab_library_upenn_edu="$(vault kv get -field=ro-token REDACTED)"
+  - export TF_VAR_nnn_host="${NNN_HOST}"
+  - export TF_VAR_nnn_password="$(vault kv get -field=password REDACTED)"
+  - export TF_VAR_nnn_username="$(vault kv get -field=username REDACTED)"
+  - export TF_VAR_resource_record_value="$(cat cloudfront_domain.env)"
+  - export TF_VAR_resource_record_name="${DISTRIBUTION_HOST_NAME}"
+
+variables:
+  TF_INIT_FLAGS: "-lockfile=readonly"
+  TF_ROOT: ${CI_PROJECT_DIR}
+  TF_STATE_NAME: "x"
+
+run_aws_cli:
+  image: 
+    name: amazon/aws-cli:latest
+    entrypoint: [""]
+  stage: run_aws_cli
+  variables:
+    SOURCE_BUCKET_DOMAIN: ${SOURCE_BUCKET_DOMAIN}
+    SOURCE_BUCKET_NAME: ${SOURCE_BUCKET_NAME}
+    STACK_NAME: ${STACK_NAME}
+    CACHE_SSL_CERTIFICATE: "REDACTED"
+    DISTRIBUTION_HOST_NAME: ${DISTRIBUTION_HOST_NAME}
+    CACHE_POLICY_NAME: ${CACHE_POLICY_NAME}
+    OACName: ${OAC_NAME}
+
+  before_script:
+    - !reference [".install_hashicorp_vault", "before_script"]
+    - !reference [".vault_jwt_auth", "before_script"]
+    - export AWS_ACCESS_KEY="$(vault kv get -field=access_key REDACTED)"
+    - export AWS_SECRET_KEY="$(vault kv get -field=secret_key REDACTED)"
+    - echo -e "[garfield]\naws_access_key_id=${AWS_ACCESS_KEY}\naws_secret_access_key=${AWS_SECRET_KEY}" > credentials.txt
+    - echo -e "[profile garfield]\nregion=us-east-1" > config.txt
+    - export AWS_CONFIG_FILE="./config.txt"
+    - export AWS_SHARED_CREDENTIALS_FILE="./credentials.txt"
+  script:
+    - aws cloudformation deploy --template-file ./cloudformation.yml  --stack-name ${STACK_NAME} --parameter-overrides OACName=${OAC_NAME} CachePolicyName=${CACHE_POLICY_NAME} SourceBucketDomain=${SOURCE_BUCKET_DOMAIN} SourceBucketName=${SOURCE_BUCKET_NAME} CacheSSLCertificate=${CACHE_SSL_CERTIFICATE} DistributionHostName=${DISTRIBUTION_HOST_NAME} --profile garfield
+    - aws cloudformation list-exports --query "Exports[?Name==\`${STACK_NAME}:DistributionId\`].Value" --profile garfield --output text > cloudfront_distribution_id.env
+    - aws cloudformation list-exports --query "Exports[?Name==\`${STACK_NAME}:OACId\`].Value" --profile garfield --output text > cloudfront_oac_id.env
+    - export OAC_ID="$(cat cloudfront_oac_id.env)"
+    - export DISTRIBUTION_ID="$(cat cloudfront_distribution_id.env)"
+    - aws cloudfront get-distribution-config --id ${DISTRIBUTION_ID} --profile garfield --output yaml > dist-config.yaml
+    - sed -i "s/OriginAccessControlId:\s''/OriginAccessControlId:\ '${OAC_ID}'/" dist-config.yaml
+    - sed -i 's/ETag/IfMatch/' dist-config.yaml
+    - aws cloudfront update-distribution --id ${DISTRIBUTION_ID} --profile garfield --cli-input-yaml file://dist-config.yaml
+    - aws cloudformation list-exports --query "Exports[?Name==\`garfield-distribution-domain-${DISTRIBUTION_HOST_NAME}\`].Value" --profile garfield --output text > cloudfront_domain.env
+
+  environment:
+    name: ${ENVIRONMENT_NAME}
+    url: ${ENVIRONMENT_URL}
+  artifacts:
+    paths:
+      - cloudfront_domain.env
+  tags:
+    - ${RUNNER}
+
+fmt:
+  extends: .terraform:fmt
+  tags:
+    - build
+
+validate:
+  extends: .terraform:validate
+  before_script:
+    - *prepare_env
+  environment:
+    name: ${ENVIRONMENT_NAME}
+  needs: 
+    - job: run_aws_cli
+      artifacts: true
+  tags:
+    - build
+
+kics-iac-sast:
+  tags:
+    - build
+
+create_plan:
+  extends: .terraform:build
+  before_script:
+    - *prepare_env
+    - gitlab-terraform init
+  environment:
+    name: ${ENVIRONMENT_NAME}
+  variables:
+    TF_IMPLICIT_INIT: "false"
+    TF_STATE_NAME: "${ENVIRONMENT_NAME}"
+  rules:
+    - if: ($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_BRANCH == "staging")
+  needs: 
+    - job: run_aws_cli
+      artifacts: true
+  tags:
+    - build
+
+apply_plan:
+  extends: .terraform:deploy
+  before_script:
+    - *prepare_env
+    - gitlab-terraform init
+  environment:
+    name: ${ENVIRONMENT_NAME}
+  variables:
+    TF_IMPLICIT_INIT: "false"
+    TF_STATE_NAME: "${ENVIRONMENT_NAME}"
+  rules:
+    - if: ($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_BRANCH == "staging")
+  when: manual
+  needs:
+    - job: run_aws_cli
+      artifacts: true
+    - job: create_plan
+      artifacts: true
+  tags:
+    - deploy

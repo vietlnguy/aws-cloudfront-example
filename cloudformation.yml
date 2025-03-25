@@ -1,0 +1,102 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  DistributionHostName:
+    Type: String
+  SourceBucketDomain: 
+    Type: String
+  SourceBucketName:
+    Type: String
+  CacheSSLCertificate:
+    Type: String
+  CachePolicyName:
+    Type: String
+  OACName:
+    Type: String
+Resources:
+  CachePolicyId:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        DefaultTTL: 86400
+        MaxTTL: 31536000
+        MinTTL: 1
+        Name: !Ref CachePolicyName
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          EnableAcceptEncodingGzip: false
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+        - DomainName: !Ref SourceBucketDomain
+          Id: s3Origin
+          S3OriginConfig:
+            OriginAccessIdentity: ''
+        Enabled: true
+        HttpVersion: http2
+        Aliases:
+        - !Sub '${DistributionHostName}'
+        DefaultCacheBehavior:
+          AllowedMethods:
+          - GET
+          - HEAD
+          CachePolicyId: !Ref CachePolicyId
+          TargetOriginId: s3Origin
+          ViewerProtocolPolicy: redirect-to-https
+        DefaultRootObject: 'index.html'
+        PriceClass: PriceClass_200
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CacheSSLCertificate
+          MinimumProtocolVersion: TLSv1
+          SslSupportMethod: sni-only
+    DependsOn: 
+    - CachePolicyId
+  OACId:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties: 
+      OriginAccessControlConfig: 
+        Name: !Ref OACName
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  OACBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Sid: AllowCloudFrontServicePrincipalReadOnly
+          Effect: Allow
+          Principal:
+            Service: cloudfront.amazonaws.com
+          Action: s3:GetObject
+          Resource: !Sub 'arn:aws:s3:::${SourceBucketName}/*'
+          Condition:
+            StringEquals:
+              AWS:SourceArn:  !Sub 'arn:aws:cloudfront::996847029658:distribution/${Distribution}'
+    DependsOn:
+      - Distribution
+Outputs:
+  OACOutput:
+    Description: The id of the OAC Resource
+    Value: !Ref OACId
+    Export:
+      Name: !Sub '${AWS::StackName}:OACId'
+  DistributionDomain:
+    Description: The domain of the Distribution
+    Value: !GetAtt Distribution.DomainName
+    Export:
+      Name: !Sub 'garfield-distribution-domain-${DistributionHostName}' 
+  DistributionId:
+    Description: Distribution ID
+    Value:
+      Ref: Distribution
+    Export:
+      Name: !Sub '${AWS::StackName}:DistributionId'

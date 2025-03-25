@@ -1,4 +1,4 @@
-# aws-cloudfront-example
+# AWS CloudFront Deployment
 
 This project is a copy of a GitLab pipeline/deployment. Its purpose is to showcase my skills as a DevOps engineer. Some information has been redacted for privacy/security reasons. It does not work on GitHub.
 
